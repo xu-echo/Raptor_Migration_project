@@ -1,0 +1,720 @@
+---
+title: "pro1"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(rio) # import data set
+library(tidyverse) # ggplot2; dplyr; tidyr; tibble; forcats
+library(glmmTMB)
+library(stringr) # change variable names
+library(chron)
+library(plyr)
+library(patchwork) # combine graphs
+library(MASS)
+library(mice) # impute missing data
+library(nlme)
+library(mgcv)
+library(DHARMa) # for glmmTMB model checking
+library(ggpubr)
+library(ggstance)
+library(stargazer)
+```
+
+## Import data
+```{r}
+HawkWatch <- import("HMworkingdatav2.xlsx")
+names(HawkWatch)<-stringr::str_replace_all(names(HawkWatch), c(" " = "."))
+
+# Replace all zeros to NA in Humidity and BARO
+HawkWatch$Humidity[HawkWatch$Humidity == 0] <- NA
+HawkWatch$BARO[HawkWatch$BARO == 0] <-NA
+```
+
+# Correct mistake in the ID for the counter and observers
+# Group species 
+# Define migration period
+```{r}
+tbl_HawkWatch <- as_tibble(HawkWatch)
+
+tidy_HawkWatch = tbl_HawkWatch %>%
+  # Exclude the row if there is zero people observing zero bird over a time period
+  # lasting zero minutes
+  filter(!(Counter == "NA" & TOTAL == 0 & Duration == 0)) %>%
+  tibble::rownames_to_column() %>%
+  mutate(# Creat an artificial ID for Counter who was not written down by mistake
+         Counter  = ifelse(Counter == "NA", paste("anonymous",rowname,sep="_"), Counter),
+         people.sum = ifelse(Counter != Observer.1 & Counter != Observer2.new & Counter != Observer.3 & Counter != Observer.4,
+                             (Observer.1 != "NA") + (Observer2.new != "NA") + (Observer.3 != "NA") + (Observer.4 != "NA") + 1,
+                             (Observer.1 != "NA") + (Observer2.new != "NA") + (Observer.3 != "NA") +(Observer.4 != "NA")),
+         people.diff = (Observer/Duration) - people.sum,
+         people.total = ifelse(people.diff >= 0, Observer/Duration, people.sum)) %>%
+  # Creat an artificial ID when Counter and Observer.1/Observer2.new/Observer.3 have the same ID by mistake
+  mutate(Observer.1 = ifelse(Counter == Observer.1, paste("anonymous1",rowname, sep="_"), as.character(Observer.1)),
+         Observer2.new = ifelse(Counter == Observer2.new , paste("anonymous2",rowname, sep="_"), as.character(Observer2.new)),
+         Observer.3 = ifelse(Counter == Observer.3, paste("anonymous3",rowname, sep="_"), as.character(Observer.3))) %>%
+  # Count revised population
+  mutate(people.sum = (Observer.1 != "NA") + (Observer2.new != "NA") +(Observer.3 != "NA") + (Observer.4 != "NA") + 1,
+         people.diff = people.total - people.sum) %>%
+  mutate(# Creat an artificial ID for Observer.1 and Observer2.new who have missing values
+         Observer2.new  = as.factor(ifelse(Observer.1 != "NA" & Observer2.new == "NA" & people.diff == 1, paste("anonymous2",rowname, sep="_"), as.character(Observer2.new))),
+         Observer.1     = as.factor(ifelse(Observer.1 == "NA" & people.diff == 1, paste("anonymous1",rowname, sep="_"), as.character(Observer.1))),
+         Counter        = as.factor(Counter),
+         Observer.3     = as.factor(Observer.3),
+         Observer.4     = as.factor(Observer.4),
+         Month          = as.factor(Month),
+         Wind.Spd2      = as.factor(Wind.Spd2),
+         Wind.Dir       = as.factor(Wind.Dir),
+         Visibility     = as.numeric(Visibility),
+         Precipitation2 = as.factor(Precipitation2),
+         # Group raptor species
+         hawk           = as.integer(SS+CH+NG+RS+BW+RT+RL+UA+NH+OS),
+         buzzard        = as.integer(UB+BV+TV),
+         falcon         = as.integer(PG+ML+AK),
+         eagle          = as.integer(BE+GE+UE),
+         TOTAL          = as.integer(TOTAL),
+         # Define migration period
+         period         = as.factor(ifelse(Month == "02"|Month == "03"|Month == "04"|Month == "05", "Spring", "Fall"))) %>%
+  dplyr::select(rowname, Date, Month, Year, Start, End, Duration, Observer, TOTAL, hawk, buzzard, falcon, eagle, Wind.Spd2, Wind.Dir, Temp, Humidity, BARO, Cloud.Cover, Visibility, Precipitation2, Counter, Observer.1, Observer2.new, Observer.3, Observer.4, people.total, period) 
+```
+
+# Sort the most experienced observer per observation
+```{r}
+# Count the frequency of Observers' ID
+observer.gather = tidy_HawkWatch %>%
+  dplyr::select(Observer.1:Observer.4) %>%
+  gather(Observer.1:Observer.4,
+         key = "observer", value = "id") %>%
+  group_by(id) %>%
+  dplyr::mutate(n = n()) %>%
+  dplyr::mutate(n = ifelse(id == "NA", 0, n))
+
+# Total number of observations
+total.row = nrow(tidy_HawkWatch) #1318 
+
+tidy_HawkWatch = tidy_HawkWatch %>%
+  mutate(frequency1 = observer.gather$n[1:1318],
+         frequency2 = observer.gather$n[1319:2636],
+         frequency3 = observer.gather$n[2637:3954],
+         frequency4 = observer.gather$n[3955:5272]) %>%
+  mutate(skilled.observer = "NA") 
+
+for (i in 1:total.row) {
+     tidy_HawkWatch$skilled.observer[i] = case_when(max(tidy_HawkWatch$frequency1[i],tidy_HawkWatch$frequency2[i], tidy_HawkWatch$frequency3[i],tidy_HawkWatch$frequency4[i]) ==  tidy_HawkWatch$frequency1[i] ~ as.character(tidy_HawkWatch$Observer.1[i]),
+                                        max(tidy_HawkWatch$frequency1[i],tidy_HawkWatch$frequency2[i],tidy_HawkWatch$frequency3[i],tidy_HawkWatch$frequency4[i])== tidy_HawkWatch$frequency2[i] ~ as.character(tidy_HawkWatch$Observer2.new[i]),
+                                        max(tidy_HawkWatch$frequency1[i],tidy_HawkWatch$frequency2[i],tidy_HawkWatch$frequency3[i],tidy_HawkWatch$frequency4[i])== tidy_HawkWatch$frequency3[i] ~ as.character(tidy_HawkWatch$Observer.3[i]), 
+                                        max(tidy_HawkWatch$frequency1[i],tidy_HawkWatch$frequency2[i],tidy_HawkWatch$frequency3[i],tidy_HawkWatch$frequency4[i])== tidy_HawkWatch$frequency4[i] ~ as.character(tidy_HawkWatch$Observer.4[i]))
+} 
+
+tidy_HawkWatch = tidy_HawkWatch %>%
+  mutate(skilled.observer = as.factor(ifelse(skilled.observer == "NA", "absence", as.character(skilled.observer)))) %>%
+  dplyr::select(-(Observer.1:Observer.4), -(frequency1:frequency4))
+```
+
+# Check NAs in the original dataset
+```{r}
+# count NAs
+sapply(HawkWatch, function(x) sum(is.na(x)))
+# Wind.Dir          Humidity           BARO 
+#    2                 45               57
+sapply(HawkWatch, function(x) mean(is.na(x)))
+# Wind.Dir          Humidity           BARO 
+#0.00151630       0.03411676        0.04321456 
+
+# Check the rows containing missing data in Wind.Dir, Humidity and BARO
+HawkWatch %>%
+  filter(is.na(Wind.Dir)|is.na(Humidity)|is.na(BARO)) # 59 rows
+## we found that there are charater NA in Wind direction
+str(HawkWatch)
+```
+
+# Check NAs in the tidy_HawkWatch
+```{r}
+sapply(tidy_HawkWatch, function(x) sum(is.na(x)))
+# Wind.Dir          Humidity           BARO        Visibility
+#    2                 45               57             5 
+sapply(tidy_HawkWatch, function(x) mean(is.na(x)))
+# Wind.Dir          Humidity           BARO                Visibility
+#0.001519757       0.034194529        0.043313070          0.003799392
+
+# Check the rows containg missing data in Wind.Dir, Humidity, BARO and Visibility
+tidy_HawkWatch %>%
+  filter(is.na(Wind.Dir)|is.na(Humidity)|is.na(BARO)|is.na(Visibility))
+# Total of 64 (59+5) rows, missing values for Visibility in the row 180,223,224,919,1108
+# Three decimal values and two character "NA" result in NA for Visibility
+# There are character "NA" existing in Wind.Dir and Precipication2
+```
+
+# Detect NAs and impute missing values
+```{r}
+tidy_HawkWatch1 = tidy_HawkWatch %>%
+  mutate(# Replace decimal values to numeric values and turn character "NA" into NA in Visibility
+         Visibility     = ifelse(rowname == "180" | rowname == "223", 0.5,
+                             ifelse(rowname == "224", 0.25,
+                                    ifelse(rowname == "919" | rowname == "1108", NA, Visibility))),
+         # Turn character "NA" into NA in Wind.Dir and Precipitation2
+         Wind.Dir       = as.factor(ifelse(Wind.Dir == "NA", NA, as.character(Wind.Dir))),
+         Precipitation2 = as.factor(ifelse(Precipitation2 == "NA", 
+                                           NA, as.character(Precipitation2)))) %>%
+  mutate(# Collapse wind direction based on its main direction
+        Wind.Dir = as.factor(forcats::fct_collapse(
+        Wind.Dir, 
+        N = c("N", "NW", "NNW", "NE"),
+        other = c("W", "E", "Variable", "ENE", "WNW", "WSW", "ESE"),
+        S = c("S", "SSW", "SSE", "SE", "SW"))),
+        # Define a new group for precipitation
+        Precipitation2 = as.factor(ifelse(Precipitation2 %in% c(2, 4, 5, 6),
+                                           "2/4/5/6", as.character(Precipitation2))))
+
+tidy_HawkWatch1
+```
+
+```{r}
+sapply(tidy_HawkWatch1, function(x) sum(is.na(x)))
+# Wind.Dir          Humidity           BARO        Visibility    Precipitation2 
+#    10                 45               57             2             23 
+sapply(tidy_HawkWatch1, function(x) mean(is.na(x)))
+```
+
+
+```{r}
+tidy_HawkWatch1 %>%
+  filter(is.na(Wind.Dir)|is.na(Humidity)|is.na(BARO)|is.na(Visibility)|is.na(Precipitation2))
+
+# Check the outliers in BARO
+tidy_HawkWatch1 %>%
+  filter(BARO < 1|BARO > 34) # One is at 0.85, 14 outliers is above 34
+```
+
+```{r}
+tidy_HawkWatch2 = tidy_HawkWatch1 %>%
+  mutate(# Impute missing values in Wind.Dir and Precipitation2 
+         Wind.Dir       = as.factor(ifelse(is.na(Wind.Dir), "other", as.character(Wind.Dir))),
+         Precipitation2 = as.factor(ifelse(is.na(Precipitation2), 0, as.character(Precipitation2))),
+         # Correct BARO at nearly 0 inHG or above 34 inHG
+         BARO           = ifelse(BARO == 0.85, 29.85, 
+                          ifelse(BARO > 34, BARO - 10, BARO)))
+tidy_HawkWatch2
+```
+
+```{r}
+sapply(tidy_HawkWatch2, function(x) sum(is.na(x)))
+# Humidity        BARO        Visibility    
+#   45             57             2           
+```
+
+# Impute missing data of BARO by mean imputation
+```{r}
+# The number of values in BARO without NA
+BARO.no = length((tidy_HawkWatch2$BARO))-sum(is.na(tidy_HawkWatch2$BARO)) #1261
+
+BARO.mean = mean(tidy_HawkWatch2$BARO, na.rm = TRUE) # 30.0407
+BARO.se = sd(tidy_HawkWatch2$BARO, na.rm = TRUE)/sqrt(BARO.no) # 0.01135463
+
+# Impute the missing values of BARO by mean imputation
+tidy_HawkWatch3 = tidy_HawkWatch2 %>%
+  mutate(BARO = ifelse(is.na(BARO), BARO.mean, BARO))
+BARONew.se = sd(tidy_HawkWatch3$BARO, na.rm = TRUE)/sqrt(nrow(tidy_HawkWatch3)) # 0.01086339
+tidy_HawkWatch3
+```
+
+# Impute missing values of Humidity
+```{r}
+# The number of values in Humidity without NA
+Humidity.no = length((tidy_HawkWatch3$Humidity))-sum(is.na(tidy_HawkWatch3$Humidity))
+
+# Humidity.mean = mean(tidy_HawkWatch3$Humidity, na.rm = TRUE) # 74.89081
+# Humidity.se = sd(tidy_HawkWatch3$Humidity, na.rm = TRUE)/sqrt(Humidity.no) # 0.4948825
+
+impute_HawkWatch = tidy_HawkWatch3 %>%
+  dplyr::select(Temp, Humidity, Precipitation2, BARO)
+# numeric_HawkWatch1 = tidy_HawkWatch3 %>%
+#   dplyr::select(Temp, Humidity, BARO)
+# Drop NAs
+#dropNA_HawkWatch = tidy_HawkWatch2 %>%
+  #drop_na()
+
+# Use predictive mean matching (numeric data) and take 50 iterations to impute missing values of Humidity
+tempData = mice(impute_HawkWatch, m=5, maxit=50, meth='pmm', seed=500)
+#tempData1 = mice(numeric_HawkWatch1, m=5, maxit=50, meth='pmm', seed=500) 
+#summary(tempData)
+completedData = complete(tempData,1)
+#completedData1 = complete(tempData1,1)
+
+tidy_HawkWatch4 = tidy_HawkWatch3 %>%
+  mutate(Humidity = completedData$Humidity)
+tidy_HawkWatch4
+```
+
+# Remove outliers and missing values 
+```{r}
+# Check and delete rows containing outliers in Humidity and Cloud.Cover
+which(tidy_HawkWatch4$Humidity > 100 | tidy_HawkWatch4$Cloud.Cover > 100 ) # row 427 428
+tidy_HawkWatch4 = tidy_HawkWatch4[-c(427,428),]
+
+# Remove the rows where the missing values for precipitation are not sure
+which(tidy_HawkWatch4$rowname == 1111 | tidy_HawkWatch4$rowname == 1112 ) # row 1109 1110
+tidy_HawkWatch4 = tidy_HawkWatch4[-c(1109,1110),]
+
+# Remove the rows containing NAs in Visibility
+which(is.na(tidy_HawkWatch4$Visibility)) # row 917 1106
+tidy_HawkWatch4 = tidy_HawkWatch4[-c(917,1106),]
+
+sapply(tidy_HawkWatch4, function(x) sum(is.na(x)))
+```
+
+# Explanatory analysis
+```{r}
+# The distribution for TOTAL is quite different in different migration period
+ggplot(tidy_HawkWatch, aes(x = Date, y = TOTAL)) +
+ geom_point(alpha = 0.15, color = "blue") +
+ ylab("Total number of raptors observed")
+  
+# Create the subset for outlier
+outlier1 <- subset(tidy_HawkWatch, Humidity > 100)
+outlier2 <- subset(tidy_HawkWatch, Cloud.Cover > 100)
+outlier3 <- subset(tidy_HawkWatch, BARO <1 |BARO > 34)
+
+# Plots of numerical variables against total counts
+p1 = ggplot(tidy_HawkWatch, aes(x = Humidity, y = TOTAL, color = period)) +
+  geom_point(alpha = 1/5) + # the base plot
+  geom_point(data = outlier1, colour = "red") +# Point outlier 
+  xlab("Humidity(%)") + ylab("Total number of raptors observed") +
+  labs(color = "Migration period" ) 
+p2 = ggplot(tidy_HawkWatch, aes(x = Cloud.Cover, y = TOTAL,color = period)) +
+  geom_point(alpha = 1/5) + # the base plot
+  geom_point(data = outlier2, colour = "red") + # Point outlier
+  xlab("Cloud Cover(%)") + ylab("Total number of raptors observed") +
+  labs(color = "Migration period" ) 
+p3 = ggplot(tidy_HawkWatch, aes(x = BARO, y = TOTAL, color = period)) +
+  geom_point(alpha = 1/5) + # the base plot
+  geom_point(data = outlier3, colour = "red") + # Point outlier
+  xlab("Barometric pressure(in Hg)") + ylab("Total number of raptors observed") +
+  labs(color = "Migration period" ) 
+p4 = ggplot(tidy_HawkWatch, aes(x = Wind.Spd2, y = TOTAL, color = period)) +
+  geom_point(alpha = 1/5) + # the base plot
+  xlab("Wind speed levels") + ylab("Total number of raptors observed") +
+  labs(color = "Migration period" ) 
+p5 = ggplot(tidy_HawkWatch, aes(x = Temp, y = TOTAL, color = period)) +
+  geom_point(alpha = 1/5) + # the base plot
+  xlab("Temperature(C)") + ylab("Total number of raptors observed") +
+  labs(color = "Migration period" ) 
+p6 = ggplot(tidy_HawkWatch, aes(x = Visibility, y = TOTAL, color = period)) +
+  geom_point(alpha = 1/5) + # the base plot
+  xlab("Visibility(km)") + ylab("Total number of raptors observed") +
+  labs(color = "Migration period" ) 
+
+ggarrange(p1, p2, p3, p4, p5, p6, ncol = 2, nrow = 3, common.legend = TRUE, legend="bottom")
+
+# Create the subset excluding missing value of precipitation
+sub.pre <- subset(tidy_HawkWatch, Precipitation2 != "NA")
+sub.dir <- subset(tidy_HawkWatch, Wind.Dir != "NA"| Wind.Dir != NA)
+# Plots of categorical variables against total counts
+p7 = ggplot(data = sub.pre, aes(x = Precipitation2, y = sqrt(TOTAL))) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("None", "Haze or Fog", "Drizzle", "Rain", "Thunderstorm", "Snow", "Wind-driven \n dust/sand/snow")) +
+  xlab("Precipitation categories") + ylab("sqrt(total counts)")
+
+p8 = ggplot(data = sub.dir, aes(x = Wind.Dir, y = sqrt(TOTAL),fill = period)) +
+  geom_boxplot() +
+  xlab("Wind direction") + ylab("sqrt(total counts)") +
+  labs(fill = "Migration period" ) +
+  theme(legend.position="bottom")
+```
+
+# mgcv
+# full model - Poisson
+```{r}
+tidy_HawkWatch5 =tidy_HawkWatch4 %>%
+  mutate(Wind.Spd = as.integer(Wind.Spd2)) %>%
+  dplyr::rename(Precipitation = Precipitation2)
+          
+pgam0 <- gam(TOTAL ~ log(Duration) + Wind.Spd + Wind.Dir + Temp + Humidity + BARO + Cloud.Cover + Visibility + Precipitation + period + s(Counter, bs = "re")+s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family=poisson, method = "REML")
+summary(pgam0)
+
+par(mfrow=c(2,2))
+plot(predict(pgam0,type="response"),residuals(pgam0), main="a");abline(h=0)
+
+#The mean variance relationship assumed by the Poisson distribution seems to be ok. There is some indication that the variance increases with slightly with the linear predictor. Note that the lines are as expected due to the discrete response.
+
+plot(predict(pgam0,type="response"),pgam0$y, main="b");abline(0,1,col=2)
+plot(pgam0$linear.predictors,pgam0$y, main="c")
+qq.gam(pgam0,rep=20,level=1, main="d") 
+
+# The Poisson distribution doesnt fit that well. Because we dont seem to be in the band of residuals simulated from the fitted model. (For each replicate, data are simulated from the fitted model, and the corresponding residuals computed. This is repeated rep times. Quantiles are readily obtained from the empirical distribution of residuals so obtained.)
+
+pgam.nzeros0 = numeric()
+for (i in 1:100) {
+  pgam.simcounts0 = rpois(n = length(pgam0$residuals), lambda = predict(pgam0, type = "response"))
+  pgam.nzeros0 = c(pgam.nzeros0, sum(pgam.simcounts0 == 0))
+}
+hist(pgam.nzeros0); mean(pgam.nzeros0); sum(tidy_HawkWatch4$TOTAL == 0)
+# [1] 362.19
+# [1] 576
+abline(v = sum(tidy_HawkWatch4$TOTAL == 0), col = 2)
+
+# With the fitted values from the model with the Poisson distribution we get a lot less zeros than we have in the data. So the Poisson doesn’t fit well because we have zero-inflation. That is we have too many zeroes given the specified distribution. We try the negative binomial next.
+```
+
+
+# full model--nb# 
+```{r}
+nbgam0 <- gam(TOTAL ~ log(Duration) + Wind.Dir + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility  + period + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+summary(nbgam0)
+
+par(mfrow = c(2,2))
+plot(predict(nbgam0, type = "response"), residuals(nbgam0), 
+     xlab = "Fitted", ylab = "Residuals", main = "a")
+abline(h = 0)
+plot(predict(nbgam0, type = "response"), nbgam0$y, 
+     xlab = "Fitted", ylab = "Observed", main="b");abline(0, 1, col = 2)
+plot(nbgam0$linear.predictors, nbgam0$y, 
+     xlab = "Linear Predictors", ylab = "Observed", main = "c")
+qq.gam(nbgam0, rep = 20, level = 1, main = "d")
+
+# Simulate zeros
+th.nbgam0 = nbgam0$family$getTheta(TRUE) # Extract final theta estimate
+nbgam.nzeros0 = numeric()
+for (i in 1:100){
+  nbgam.simcounts0 = rnbinom(size = th.nbgam0, n = length(nbgam0$residuals), mu = predict(nbgam0,type ="response"))
+  nbgam.nzeros0 = c(nbgam.nzeros0, sum(nbgam.simcounts0 == 0))
+}
+
+# Distribution of simulated zeros
+hist(nbgam.nzeros0, xlab = "the number of zeros simulated", main = "Distribution of simulated zeros"); mean(nbgam.nzeros0);sum(tidy_HawkWatch4$TOTAL == 0)
+# [1] 604.38
+# [1] 576
+abline(v = sum(tidy_HawkWatch4$TOTAL == 0), col = 2)
+
+creatCoeftab = function(name, GAM, GAMrange) {
+  bGAM = coef(GAM)[GAMrange]
+  seGAM = diag(vcov(GAM))[GAMrange]
+  nms = names(bGAM)
+  df = data.frame(model = rep(name, each = length(bGAM)),
+                  term = rep(nms, 1),
+                  estimate = unname(bGAM))
+  df = transform(df,
+                 upper = estimate + sqrt(seGAM),
+                 lower = estimate - sqrt(seGAM))
+
+}
+
+# The standard deviation for random effects
+gam.vcomp(nbgam0)
+
+```
+
+# select model by AIC
+```{r}
+nbgam0 <- gam(TOTAL ~ log(Duration) + Wind.Dir + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+
+nbgam0.1 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Wind.Dir 
+
+nbgam0.2 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop period 
+
+nbgam0.3 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + period + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Wind.Spd2
+
+nbgam0.4 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + period + Wind.Spd + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Cloud.Cover
+
+nbgam0.5 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + period + Wind.Spd + Cloud.Cover+ Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Humidity 
+
+nbgam0.6 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + period + Wind.Spd + Cloud.Cover + Humidity + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Temp ##most important weather factor
+
+nbgam0.7 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + period + Wind.Spd + Cloud.Cover + Humidity + Temp + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop BARO
+
+nbgam0.8 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Precipitation2 
+
+nbgam0.9 <-  gam(TOTAL ~ log(Duration) + Wind.Dir + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Visibility
+
+nbgam0.10 <-  gam(TOTAL ~ Wind.Dir + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")#drop log(Duration)
+
+aic.vec = (c(AIC(nbgam0),AIC(nbgam0.1),AIC(nbgam0.2),AIC(nbgam0.3),AIC(nbgam0.4),AIC(nbgam0.5),AIC(nbgam0.6),AIC(nbgam0.7),AIC(nbgam0.8),AIC(nbgam0.9),AIC(nbgam0.10)))
+plot(aic.vec, ylab = "AIC", xlab = "model")
+which.min(aic.vec) #drop wind.dir
+```
+
+#drop wind.dir
+```{r}
+nbgam0.1 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+summary(nbgam0.1)
+
+par(mfrow = c(2,2))
+plot(predict(nbgam0.1, type = "response"), residuals(nbgam0.1), 
+     xlab = "Fitted", ylab = "Residuals", main = "a")
+abline(h = 0)
+plot(predict(nbgam0.1, type = "response"), nbgam0.1$y, 
+     xlab = "Fitted", ylab = "Observed", main="b");abline(0, 1, col = 2)
+plot(nbgam0.1$linear.predictors, nbgam0.1$y, 
+     xlab = "Linear Predictors", ylab = "Observed", main = "c")
+qq.gam(nbgam0.1, rep = 20, level = 1, main = "d")
+
+# Simulate zeros
+th.nbgam01 = nbgam0.1$family$getTheta(TRUE) # Extract final theta estimate
+nbgam.nzeros01 = numeric()
+for (i in 1:100){
+  nbgam.simcounts01 = rnbinom(size = th.nbgam01, n = length(nbgam0.1$residuals), mu = predict(nbgam0.1,type ="response"))
+  nbgam.nzeros01 = c(nbgam.nzeros01, sum(nbgam.simcounts01 == 0))
+}
+
+# Distribution of simulated zeros
+hist(nbgam.nzeros01, xlab = "the number of zeros simulated", main = "Distribution of simulated zeros"); mean(nbgam.nzeros01);sum(tidy_HawkWatch4$TOTAL == 0)
+# [1] 608.85
+# [1] 576
+abline(v = sum(tidy_HawkWatch4$TOTAL == 0), col = 2)
+
+
+```
+
+```{r}
+nbgam0.1 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+
+nbgam01.1 <-  gam(TOTAL ~ log(Duration) + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop period 
+
+nbgam01.2 <-  gam(TOTAL ~ log(Duration) + period + Cloud.Cover + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Wind.Spd2 
+
+nbgam01.3 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Cloud.Cover
+
+nbgam01.4 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Humidity 
+
+nbgam01.5 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Humidity+ BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Temp #most important
+
+nbgam01.6 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Humidity + Temp + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop BARO 
+
+nbgam01.7 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Precipitation2 
+
+nbgam01.8 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Cloud.Cover + Humidity + Temp + BARO + Precipitation + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop Visibility 
+
+
+aic.vec1 = (c(AIC(nbgam0.1),AIC(nbgam01.1),AIC(nbgam01.2),AIC(nbgam01.3),AIC(nbgam01.4),AIC(nbgam01.5),AIC(nbgam01.6),AIC(nbgam01.7),AIC(nbgam01.8)))
+plot(aic.vec1, ylab = "AIC", xlab = "model")
+which.min(aic.vec1) # drop cloud cover
+```
+
+# final model excluding wind direction and cloud cover
+```{r}
+nbgam01.3 <-  gam(TOTAL ~ log(Duration) + period + Wind.Spd + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+
+summary(nbgam01.3)
+
+par(mfrow = c(2,2))
+plot(predict(nbgam01.3, type = "response"), residuals(nbgam01.3), 
+     xlab = "Fitted", ylab = "Residuals", main = "a")
+abline(h = 0)
+plot(predict(nbgam01.3, type = "response"), nbgam01.3$y, 
+     xlab = "Fitted", ylab = "Observed", main="b");abline(0, 1, col = 2)
+plot(nbgam01.3$linear.predictors, nbgam01.3$y, 
+     xlab = "Linear Predictors", ylab = "Observed", main = "c")
+qq.gam(nbgam01.3, rep = 20, level = 1, main = "d")
+
+# Simulate zeros
+th.nbgam01.3 = nbgam01.3$family$getTheta(TRUE) # Extract final theta estimate
+nbgam.nzeros01.3 = numeric()
+for (i in 1:100){
+  nbgam.simcounts01.3 = rnbinom(size = th.nbgam01.3, n = length(nbgam01.3$residuals), mu = predict(nbgam01.3,type ="response"))
+  nbgam.nzeros01.3 = c(nbgam.nzeros01.3, sum(nbgam.simcounts01.3 == 0))
+}
+
+# Distribution of simulated zeros
+hist(nbgam.nzeros01.3, xlab = "the number of zeros simulated", main = "Distribution of simulated zeros"); mean(nbgam.nzeros01.3);sum(tidy_HawkWatch4$TOTAL == 0)
+# [1] 608.85
+# [1] 576
+abline(v = sum(tidy_HawkWatch4$TOTAL == 0), col = 2)
+
+```
+
+# Test the significance of random effects
+```{r}
+m2 <- gam(TOTAL ~ log(Duration) + period + Wind.Spd + Humidity + Temp + BARO + Precipitation + Visibility + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") #drop counter effect
+m1 <- gam(TOTAL ~ log(Duration) + period + Wind.Spd + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML") # drop observer effect
+m0 <-gam(TOTAL ~ log(Duration) + period + Wind.Spd + Humidity + Temp + BARO + Precipitation + Visibility, data = tidy_HawkWatch5, family = nb, method = "REML") # without random effects
+
+aic.vec.re = (c(AIC(nbgam01.3),AIC(m2),AIC(m1),AIC(m0)))
+re.data = data.frame(model = c("final model", "model 1", "model 2", "model 3"),
+                  AIC = aic.vec.re)
+plot(aic.vec.re, ylab = "AIC", xlab = "model")
+which.min(aic.vec.re)
+ggplot(re.data , aes(x = model, y = AIC)) + 
+  geom_point()
+```
+
+```{r}
+mfinal.coefs = creatCoeftab("Final model",nbgam01.3, GAMrange = 2:11)
+m0.coefs = creatCoeftab("Full model",nbgam0, GAMrange = 2:14)
+model_data = rbind(mfinal.coefs,m0.coefs)
+ggplot(model_data, aes(x = estimate, y = term,colour = model,xmax = upper, xmin = lower)) +
+   geom_pointrangeh(position = position_dodgev(height = 0.5)) + 
+  geom_vline(xintercept = 0, linetype="dotted", 
+                color = "blue", size=0.5)
+AIC(nbgam0)#6082.816
+AIC(nbgam01.3)#6078.873
+```
+
+```{r}
+m2.coefs = creatCoeftab("Model 2",m2, GAMrange = 2:11)
+m1.coefs = creatCoeftab("Model 1",m1, GAMrange = 2:11)
+m.coefs = creatCoeftab("Model 0",m0, GAMrange = 2:11)
+model_re = rbind(mfinal.coefs, m2.coefs,m1.coefs,m.coefs)
+ggplot(model_re, aes(x = estimate, y = term,colour = model,xmax = upper, xmin = lower)) +
+   geom_pointrangeh(position = position_dodgev(height = 0.5)) + 
+  geom_vline(xintercept = 0, linetype="dotted", 
+                color = "blue", size=0.5)
+```
+
+# Output coefficient estimates
+```{r}
+stargazer(nbgam0, nbgam01.3, type="text",
+ dep.var.labels=c("Miles/(US) gallon","Fast car (=1)"),
+ covariate.labels=c("Gross horsepower","Rear axle ratio","Four foward gears",
+ "Five forward gears","Type of transmission (manual=1)"), out="models.txt")
+coe.0 = round(exp(coefficients(nbgam01.3)[0:11]),3)
+coe.1 = round(exp(coefficients(nbgam2)[0:11]),3)
+coe.2 = round(exp(coefficients(nbgam3)[0:10]),3)
+coe.3 = round(exp(coefficients(nbgam4)[0:8]),3)
+coe.4 = round(exp(coefficients(nbgam5)[0:8]),3)
+stargazer(coe.0,coe.1,coe.2,coe.3,coe.4)
+```
+
+
+
+
+# model for hawks
+```{r}
+nbgam2 <- gam(hawk ~ log(Duration)+ period + Wind.Spd  + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+summary(nbgam2)
+
+par(mfrow = c(2,2))
+plot(predict(nbgam2, type = "response"), residuals(nbgam2),
+     xlab = "Fitted", ylab = "Residuals", main = "a")
+abline(h = 0)
+plot(predict(nbgam2, type = "response"), nbgam2$y, 
+     xlab = "Fitted", ylab = "Observed", main="b");abline(0, 1, col = 2)
+plot(nbgam2$linear.predictors, nbgam2$y, 
+      xlab = "Linear Predictors", ylab = "Observed", main = "c")
+qq.gam(nbgam2, rep = 20, level = 1, main = "d")
+
+# Simulate zeros
+th.nbgam2 = nbgam2$family$getTheta(TRUE) # Extract final theta estimate
+nbgam.nzeros2 = numeric()
+for (i in 1:100){
+  nbgam.simcounts2 = rnbinom(size = th.nbgam2, n = length(nbgam2$residuals), mu = predict(nbgam2,type ="response"))
+  nbgam.nzeros2 = c(nbgam.nzeros2, sum(nbgam.simcounts2 == 0))
+}
+
+# Distribution of simulated zeros
+hist(nbgam.nzeros2, xlab = "the number of zeros simulated", main = "Distribution of simulated zeros"); mean(nbgam.nzeros2);sum(tidy_HawkWatch4$hawk == 0)
+# [1] 709.47
+# [1] 675
+abline(v = sum(tidy_HawkWatch4$hawk == 0), col = 2)
+```
+
+# model for buzzards
+```{r}
+nbgam3 <- gam(buzzard ~  period +  Wind.Spd + Humidity + Temp + BARO + Precipitation + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+summary(nbgam3)
+
+par(mfrow = c(2,2))
+plot(predict(nbgam3, type = "response"), residuals(nbgam3),
+     xlab = "Fitted", ylab = "Residuals", main = "a")
+abline(h = 0)
+plot(predict(nbgam3, type = "response"), nbgam3$y, 
+     xlab = "Fitted", ylab = "Observed", main="b");abline(0, 1, col = 2)
+plot(nbgam3$linear.predictors, nbgam3$y, 
+      xlab = "Linear Predictors", ylab = "Observed", main = "c")
+qq.gam(nbgam3, rep = 20, level = 1, main = "d")
+
+# Simulate zeros
+th.nbgam3 = nbgam3$family$getTheta(TRUE) # Extract final theta estimate
+nbgam.nzeros3 = numeric()
+for (i in 1:100){
+  nbgam.simcounts3 = rnbinom(size = th.nbgam3, n = length(nbgam3$residuals), mu = predict(nbgam3,type ="response"))
+  nbgam.nzeros3 = c(nbgam.nzeros3, sum(nbgam.simcounts3 == 0))
+}
+
+# Distribution of simulated zeros
+hist(nbgam.nzeros3, xlab = "the number of zeros simulated", main = "Distribution of simulated zeros"); mean(nbgam.nzeros3);sum(tidy_HawkWatch4$buzzard == 0)
+# [1] 1126.62
+# [1] 1124
+abline(v = sum(tidy_HawkWatch4$buzzard == 0), col = 2)
+# not significant: log(duration), wind.spd, humidity, precipitation
+ subset(tidy_HawkWatch5, buzzard != 0)
+```
+
+
+# model for falcon
+```{r}
+nbgam4 <- gam(falcon ~ log(Duration)+ period + Wind.Spd  + Humidity + Temp + BARO + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+summary(nbgam4)
+
+par(mfrow = c(2,2))
+plot(predict(nbgam4, type = "response"), residuals(nbgam4),
+     xlab = "Fitted", ylab = "Residuals", main = "a")
+abline(h = 0)
+plot(predict(nbgam4, type = "response"), nbgam4$y, 
+     xlab = "Fitted", ylab = "Observed", main="b");abline(0, 1, col = 2)
+plot(nbgam4$linear.predictors, nbgam4$y, 
+      xlab = "Linear Predictors", ylab = "Observed", main = "c")
+qq.gam(nbgam4, rep = 20, level = 1, main = "d")
+
+# Simulate zeros
+th.nbgam4 = nbgam4$family$getTheta(TRUE) # Extract final theta estimate
+nbgam.nzeros4 = numeric()
+for (i in 1:100){
+  nbgam.simcounts4 = rnbinom(size = th.nbgam4, n = length(nbgam4$residuals), mu = predict(nbgam4,type ="response"))
+  nbgam.nzeros4 = c(nbgam.nzeros4, sum(nbgam.simcounts4 == 0))
+}
+
+# Distribution of simulated zeros
+hist(nbgam.nzeros4, xlab = "the number of zeros simulated", main = "Distribution of simulated zeros"); mean(nbgam.nzeros4);sum(tidy_HawkWatch4$falcon == 0)
+# [1] 1209.17
+# [1] 1205
+abline(v = sum(tidy_HawkWatch4$falcon == 0), col = 2)
+
+```
+
+# model fore eagles 
+```{r}
+#precipitaion 3 1
+nbgam5 <- gam(eagle ~ log(Duration)+ period + Wind.Spd  + Humidity + Temp + BARO  + Visibility + s(Counter, bs = "re") + s(skilled.observer, bs = "re"), data = tidy_HawkWatch5, family = nb, method = "REML")
+summary(nbgam5)
+
+par(mfrow = c(2,2))
+plot(predict(nbgam5, type = "response"), residuals(nbgam5),
+     xlab = "Fitted", ylab = "Residuals", main = "a")
+abline(h = 0)
+plot(predict(nbgam5, type = "response"), nbgam5$y, 
+     xlab = "Fitted", ylab = "Observed", main="b");abline(0, 1, col = 2)
+plot(nbgam5$linear.predictors, nbgam5$y, 
+      xlab = "Linear Predictors", ylab = "Observed", main = "c")
+qq.gam(nbgam5, rep = 20, level = 1, main = "d")
+
+# Simulate zeros
+th.nbgam5 = nbgam5$family$getTheta(TRUE) # Extract final theta estimate
+nbgam.nzeros5 = numeric()
+for (i in 1:100){
+  nbgam.simcounts5 = rnbinom(size = th.nbgam5, n = length(nbgam5$residuals), mu = predict(nbgam5,type ="response"))
+  nbgam.nzeros5 = c(nbgam.nzeros5, sum(nbgam.simcounts5 == 0))
+}
+
+# Distribution of simulated zeros
+hist(nbgam.nzeros5, xlab = "the number of zeros simulated", main = "Distribution of simulated zeros"); mean(nbgam.nzeros5);sum(tidy_HawkWatch4$eagle == 0)
+# [1] 1069.74
+# [1] 1059
+abline(v = sum(tidy_HawkWatch4$eagle == 0), col = 2)
+```
+
+# output coefficients estimates for groups of species
+```{r}
+hawks.coefs = creatCoeftab("Hawks",nbgam2, GAMrange = 2:11)
+buzzard.coefs = creatCoeftab("Buzzard",nbgam3, GAMrange = 2:10)
+falcon.coefs = creatCoeftab("Falcon",nbgam4, GAMrange = 2:8)
+eagle.coefs = creatCoeftab("Eagle",nbgam5, GAMrange = 2:8)
+model.species = rbind(hawks.coefs,buzzard.coefs, eagle.coefs ,falcon.coefs, mfinal.coefs)
+ggplot(model.species, aes(x = estimate, y = term,colour = model,xmax = upper, xmin = lower)) +
+   geom_pointrangeh(position = position_dodgev(height = 0.5)) + 
+  geom_vline(xintercept = 0, linetype="dotted", 
+                color = "blue", size=0.7)
+stargazer(nbgam01.3, nbgam2, nbgam3, nbgam4, nbgam5, keep = c("Constant","Wind.Spd", "Visbility", "Temp", "Precipitation", "period", "Duration", "Humidity", "BARO", "Visibility"))
+```
+
